@@ -1,17 +1,21 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 from __future__ import print_function
-from argparse import ArgumentParser
 from subprocess import check_output
 from subprocess import call
 from subprocess import Popen
+from os.path import expanduser, join
 from time import sleep
+from datetime import datetime
 from distutils import spawn
 from tempfile import NamedTemporaryFile
+from collections import namedtuple
 import json
 import re
 import sys
 import platform
+import argparse
 
 try:
     # Py3
@@ -28,6 +32,10 @@ except ImportError:
 API = "YouDaoCV"
 API_KEY = "659600698"
 
+HISTORY_DIR = '~'
+HISTORY_FILENAME = '.ydcv_history'
+DELIMITER = '!'
+
 
 class GlobalOptions(object):
     def __init__(self, options=None):
@@ -42,7 +50,59 @@ class GlobalOptions(object):
             raise AttributeError("'%s' has no attribute '%s'" % (
                 self.__class__.__name__, name))
 
+
 options = GlobalOptions()
+
+
+def touchOpen(filename, *args, **kwargs):
+    open(filename, "at").close()  # "touch" file
+    return open(filename, *args, **kwargs)
+
+
+class HistroyRecord(object):
+    word = None
+    timestamp = None
+
+    def __init__(self, word):
+        self.word = word.replace(DELIMITER, DELIMITER + DELIMITER)
+        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def __str__(self):
+        return self.word + DELIMITER + self.timestamp
+
+    @classmethod
+    def parse(cls, record):
+        word, timestamp = record.rsplit(DELIMITER, 1)
+        record = namedtuple('record', ['word', 'timestamp'])
+        return record(word.replace(DELIMITER+DELIMITER, DELIMITER), timestamp.rstrip('\n'))
+
+
+class HistoryRecords(object):
+    def __init__(self):
+        global HISTORY_DIR
+        if HISTORY_DIR == '~':
+            HISTORY_DIR = expanduser('~')
+        self.history_path = join(HISTORY_DIR, HISTORY_FILENAME)
+
+    def add(self, word):
+        history_record = HistroyRecord(word)
+        with touchOpen(self.history_path, 'at') as f:
+            f.write(str(history_record) + '\n')
+
+    def get(self, iword):
+        records = []
+        with touchOpen(self.history_path, 'rt') as f:
+            for record in f:
+                rcrd = HistroyRecord.parse(record)
+
+                if iword and rcrd.word != iword:
+                    continue
+                records.append(rcrd)
+
+        return records
+
+
+history_records = HistoryRecords()
 
 
 class Colorizing(object):
@@ -105,6 +165,20 @@ def online_resources(query):
             for lang, url in res_list if lang.match(query) is not None]
 
 
+def print_history(records):
+    cnt = options.number if not options.all else len(records)
+    for record in records:
+        row = record[0]
+        if options.count:
+            row += "\t" + str(record[2])
+        if options.date:
+            row += "\t" + record[1]
+        print(row)
+        cnt -= 1
+        if cnt == 0:
+            break
+
+
 def print_explanation(data, options):
     _c = Colorizing.colorize
     _d = data
@@ -160,11 +234,8 @@ def print_explanation(data, options):
             print(_c('\n  Web Reference:', 'cyan'))
 
             web = _d['web'] if options.full else _d['web'][:3]
-            print(*[
-                '     * {0}\n       {1}'.format(
-                    _c(ref['key'], 'yellow'),
-                    '; '.join(map(_c('{0}', 'magenta').format, ref['value']))
-                ) for ref in web], sep='\n')
+            print(*['     * {0}\n       {1}'.format(
+                _c(ref['key'], 'yellow'), '; '.join(map(_c('{0}', 'magenta').format, ref['value']))) for ref in web], sep='\n')
 
         # Online resources
         ol_res = online_resources(query)
@@ -201,7 +272,8 @@ def print_explanation(data, options):
                         else:
                             with NamedTemporaryFile(suffix=".mp3") as accent_file:
                                 if call('curl -s "{0}" -o {1}'.format(accent_url, accent_file.name), shell=True) != 0:
-                                    print(_c('Network unavailable or permission error to write file: {}'.format(accent_file), 'red'))
+                                    print(_c('Network unavailable or permission error to write file: {}'
+                                             .format(accent_file), 'red'))
                                 else:
                                     if options.player == 'mpg123':
                                         call('mpg123 -q ' + accent_file.name, shell=True)
@@ -216,68 +288,167 @@ def print_explanation(data, options):
     print()
 
 
+def lookup_history(word):
+    records = history_records.get(word)
+
+    if options.count:
+        post_records = {}
+        for record in records:
+            if post_records.get(record.word) is None:
+                post_records[record.word] = (record.timestamp, 1)
+            else:
+                post_records[record.word] = (max(record.timestamp, post_records[record.word][0]),
+                                             post_records[record.word][1] + 1)
+
+        records = []
+        for key, value in post_records.items():
+            records.append([key, value[0], value[1]])
+
+    if options.sort == 'word':
+        records.sort(key=lambda k: k[0], reverse=options.reverse)
+    elif options.sort == 'date':
+        records.sort(key=lambda k: k[1], reverse=options.reverse)
+    elif options.sort == 'count':
+        records.sort(key=lambda k: k[2], reverse=options.reverse)
+
+    print_history(records)
+
+
 def lookup_word(word):
-    word = quote(word)
-    if word == '%5Cq' or word == '%3Aq':
+    qword = quote(word)
+    if qword == '%5Cq' or qword == '%3Aq':
         sys.exit("Thanks for using, goodbye!")
     else:
         pass
     try:
-        data = urlopen(
-            "http://fanyi.youdao.com/openapi.do?keyfrom={0}&"
-            "key={1}&type=data&doctype=json&version=1.2&q={2}"
-            .format(API, API_KEY, word)).read().decode("utf-8")
+        data = urlopen("http://fanyi.youdao.com/openapi.do?keyfrom={0}&"
+                       "key={1}&type=data&doctype=json&version=1.2&q={2}".format(
+                           API, API_KEY, qword)).read().decode("utf-8")
     except IOError:
         print("Network is unavailable")
     else:
         print_explanation(json.loads(data), options)
+        history_records.add(word)
+
+
+class DefaultSubcommandArgParse(argparse.ArgumentParser):
+    __default_subparser = None
+
+    def set_default_subparser(self, name):
+        self.__default_subparser = name
+
+    def _parse_known_args(self, arg_strings, *args, **kwargs):
+        in_args = set(arg_strings)
+        d_sp = self.__default_subparser
+        if d_sp is not None and not {'-h', '--help'}.intersection(in_args):
+            for x in self._subparsers._actions:
+                subparser_found = (
+                    isinstance(x, argparse._SubParsersAction) and
+                    in_args.intersection(x._name_parser_map.keys())
+                )
+                if subparser_found:
+                    break
+            else:
+                # insert default in first position, this implies no
+                # global options without a sub_parsers specified
+                arg_strings = [d_sp] + arg_strings
+        return super(DefaultSubcommandArgParse, self)._parse_known_args(
+            arg_strings, *args, **kwargs
+        )
+
+
+def check_positive(value):
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError("%s is an invalid positive int value" % value)
+    return ivalue
 
 
 def arg_parse():
-    parser = ArgumentParser(description="Youdao Console Version")
-    parser.add_argument('-f', '--full',
-                        action="store_true",
-                        default=False,
-                        help="print full web reference, only the first 3 "
-                             "results will be printed without this flag.")
-    parser.add_argument('-s', '--simple',
-                        action="store_true",
-                        default=False,
-                        help="only show explainations. "
-                             "argument \"-f\" will not take effect.")
-    parser.add_argument('-S', '--speech',
-                        action="store_true",
-                        default=False,
-                        help="print URL to speech audio.")
-    parser.add_argument('-r', '--read',
-                        action="store_true",
-                        default=False,
-                        help="read out the word with player provided by \"-p\" option.")
-    parser.add_argument('-p', '--player',
-                        choices=['festival', 'mpg123', 'sox', 'mpv'],
-                        default='festival',
-                        help="read out the word with this play."
-                             "Default to 'festival' or can be 'mpg123', 'sox', 'mpv'."
-                             "-S option is required if player is not festival."
-                        )
-    parser.add_argument('-a', '--accent',
-                        choices=['auto', 'uk', 'us'],
-                        default='auto',
-                        help="set default accent to read the word in. "
-                             "Default to 'auto' or can be 'uk', or 'us'."
-                        )
-    parser.add_argument('-x', '--selection',
-                        action="store_true",
-                        default=False,
-                        help="show explaination of current selection.")
-    parser.add_argument('--color',
-                        choices=['always', 'auto', 'never'],
-                        default='auto',
-                        help="colorize the output. "
-                             "Default to 'auto' or can be 'never' or 'always'.")
-    parser.add_argument('words',
-                        nargs='*',
-                        help="words to lookup, or quoted sentences to translate.")
+    parser = DefaultSubcommandArgParse(description="Youdao Console Version")
+    subparser = parser.add_subparsers(description="ydcv subcommand", dest="subcommand")
+
+    parser_lookup = subparser.add_parser("lookup", help="lookup word")
+    parser_lookup.add_argument('-f', '--full',
+                               action="store_true",
+                               default=False,
+                               help="print full web reference, only the first 3 "
+                               "results will be printed without this flag.")
+    parser_lookup.add_argument('-s', '--simple',
+                               action="store_true",
+                               default=False,
+                               help="only show explainations. "
+                               "argument \"-f\" will not take effect.")
+    parser_lookup.add_argument('-S', '--speech',
+                               action="store_true",
+                               default=False,
+                               help="print URL to speech audio.")
+    parser_lookup.add_argument('-r', '--read',
+                               action="store_true",
+                               default=False,
+                               help="read out the word with player provided by \"-p\" option.")
+    parser_lookup.add_argument('-p', '--player',
+                               choices=['festival', 'mpg123', 'sox', 'mpv'],
+                               default='festival',
+                               help="read out the word with this play."
+                               "Default to 'festival' or can be 'mpg123', 'sox', 'mpv'."
+                               "-S option is required if player is not festival.")
+    parser_lookup.add_argument('-a', '--accent',
+                               choices=['auto', 'uk', 'us'],
+                               default='auto',
+                               help="set default accent to read the word in. "
+                               "Default to 'auto' or can be 'uk', or 'us'.")
+    parser_lookup.add_argument('-x', '--selection',
+                               action="store_true",
+                               default=False,
+                               help="show explaination of current selection.")
+    parser_lookup.add_argument('--color',
+                               choices=['always', 'auto', 'never'],
+                               default='auto',
+                               help="colorize the output. "
+                               "Default to 'auto' or can be 'never' or 'always'.")
+    parser_lookup.add_argument('words',
+                               nargs='*',
+                               help="words to lookup, or quoted sentences to translate.")
+
+    parser_hist = subparser.add_parser("history", help="show the history records.")
+    # 关于 ydcv history -a -n 10 不显示冲突问题，
+    # 参见Issue18943: https://bugs.python.org/issue18943 。
+    count_group = parser_hist.add_mutually_exclusive_group()
+    count_group.add_argument('-a', '--all',
+                             action="store_true",
+                             default=False,
+                             help="show the all history records.")
+    count_group.add_argument('-n', '--number',
+                             default=10,
+                             type=check_positive,
+                             metavar='number',
+                             help="show the n history records.")
+    parser_hist.add_argument('-s', '--sort',
+                             choices=['date', 'word', 'count'],
+                             default='date',
+                             help="sort the history records.")
+    parser_hist.add_argument('-r', '--reverse',
+                             action="store_true",
+                             default=False,
+                             help="reverse the history records.")
+    parser_hist.add_argument('-c', '--count',
+                             action="store_true",
+                             default=False,
+                             help="show the word counts in history records.")
+    parser_hist.add_argument('-d', '--date',
+                             action="store_true",
+                             default=False,
+                             help="show the date of looking up word in history records.")
+    parser_hist.add_argument('-x', '--selection',
+                             action="store_true",
+                             default=False,
+                             help="show history of current selection.")
+    parser_hist.add_argument('words',
+                             nargs='*',
+                             help="words to history, or quoted sentences to history record.")
+
+    parser.set_default_subparser("lookup")
     return parser.parse_args()
 
 
@@ -286,7 +457,10 @@ def main():
 
     if options.words:
         for word in options.words:
-            lookup_word(word)
+            if options.subcommand == 'lookup':
+                lookup_word(word)
+            elif options.subcommand == 'history':
+                lookup_history(word)
     else:
         if options.selection:
             last = check_output(["xclip", "-o"], universal_newlines=True)
@@ -297,29 +471,37 @@ def main():
                     if curr != last:
                         last = curr
                         if last.strip():
-                            lookup_word(last)
+                            if options.subcommand == 'lookup':
+                                lookup_word(last)
+                            elif options.subcommand == 'history':
+                                lookup_history(last)
                         print("Waiting for selection>")
                 except (KeyboardInterrupt, EOFError):
                     break
         else:
-            try:
-                import readline
-            except ImportError:
-                pass
-            while True:
+            if options.subcommand == 'history':
+                lookup_history(None)
+            elif options.subcommand == 'lookup':
                 try:
-                    if sys.version_info[0] == 3:
-                        words = input('> ')
-                    else:
-                        words = raw_input('> ')
-                    if words.strip():
-                        lookup_word(words)
-                except KeyboardInterrupt:
-                    print()
-                    continue
-                except EOFError:
-                    break
-        print("\nBye")
+                    import readline
+                except ImportError:
+                    pass
+                while True:
+                    try:
+                        if sys.version_info[0] == 3:
+                            word = input('> ')
+                        else:
+                            word = raw_input('> ')
+                        if word.strip():
+                            lookup_word(word)
+                    except KeyboardInterrupt:
+                        print()
+                        continue
+                    except EOFError:
+                        break
+        if options.subcommand == 'lookup':
+            print("\nBye")
+
 
 if __name__ == "__main__":
     main()
