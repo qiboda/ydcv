@@ -291,7 +291,7 @@ def print_explanation(data, options):
 def lookup_history(word):
     records = history_records.get(word)
 
-    if options.count:
+    if options.count or options.sort == 'count':
         post_records = {}
         for record in records:
             if post_records.get(record.word) is None:
